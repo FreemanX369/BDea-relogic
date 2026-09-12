@@ -8,13 +8,9 @@
 #property version   "1.12"
 #property description "Behavioral reconstruction of WSLOW public v1.12"
 
-#include <Trade/Trade.mqh>
-
-CTrade trade;
-
 input group "=== WFAST SLOW | GENERAL ===="
 input ulong  InpMagic                  = 1231213;
-input int    InpDirection              = 0;      // 0=BOTH, 1=BUY only, 2=SELL only
+input int    InpDirection              = 0;
 input bool   InpAllowOpeningNewBasket  = true;
 input bool   InpAllowHedging           = true;
 
@@ -27,13 +23,13 @@ input double InpMaximumSpreadPrice     = 1.0;
 input double InpMaximumSlippagePips    = 100.0;
 
 input group "=== SYMBOL / DISTANCE ===="
-input int    InpDistanceMode           = 1;      // 0=pips, 1=price
+input int    InpDistanceMode           = 1;
 input double InpTradeDistancePips      = 35.0;
 input double InpTradeDistancePrice     = 5.0;
 input int    InpMaximumTrades          = 9;
 
 input group "=== LOT SIZE ===="
-input int    InpLotMode                = 0;      // 0=fixed, 1=balance/divider scaled
+input int    InpLotMode                = 0;
 input double InpFixedLot               = 0.01;
 input double InpDynamicDivider         = 10000.0;
 input double InpMaximumLot             = 100.0;
@@ -48,8 +44,6 @@ input double InpGridSLPrice            = 0.0;
 input double InpEmergencySLPips        = 1000.0;
 input double InpEmergencySLPrice       = 150.0;
 
-// Signal parameters were not exposed by the original EX5. Keep the proxy
-// isolated here so recovered runtime semantics can replace only this module.
 #define SIGNAL_TF        PERIOD_M15
 #define SIGNAL_FAST      5
 #define SIGNAL_SLOW      21
@@ -205,7 +199,6 @@ bool SessionAllowed()
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(),dt);
    if(dt.day_of_week==0 || dt.day_of_week==6) return false;
-
    if(InpStartHour<=InpStopHour)
    {
       if(dt.hour<InpStartHour || dt.hour>InpStopHour) return false;
@@ -264,21 +257,33 @@ double BasketSL(const BasketState &b)
    double grid=GridSLDistance();
    double emergency=EmergencySLDistance();
    double d=0.0;
-
    if(grid>0.0 && emergency>0.0) d=MathMin(grid,emergency);
    else if(grid>0.0) d=grid;
    else d=emergency;
    if(d<=0.0) return 0.0;
-
    if(b.type==POSITION_TYPE_BUY) return NormalizePrice(b.p1_price-d);
    return NormalizePrice(b.p1_price+d);
+}
+
+bool ModifyPositionStops(const ulong ticket,const double sl,const double tp)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   MqlTradeRequest req={};
+   MqlTradeResult  res={};
+   req.action=TRADE_ACTION_SLTP;
+   req.position=ticket;
+   req.symbol=_Symbol;
+   req.magic=InpMagic;
+   req.sl=sl;
+   req.tp=tp;
+   if(!OrderSend(req,res)) return false;
+   return (res.retcode==TRADE_RETCODE_DONE || res.retcode==TRADE_RETCODE_NO_CHANGES);
 }
 
 bool ApplyBasketProtection()
 {
    BasketState b;
    if(!ReadBasket(b)) return true;
-
    double tp=BasketTP(b);
    double sl=BasketSL(b);
    bool ok=true;
@@ -288,14 +293,21 @@ bool ApplyBasketProtection()
       if(!IsOurPosition(ticket)) continue;
       ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       if(type!=b.type) continue;
-      if(!trade.PositionModify(ticket,sl,tp))
+      if(!ModifyPositionStops(ticket,sl,tp))
       {
-         PrintFormat("[WFAST SLOW] MODIFY FAIL ticket=%I64u ret=%u %s",
-                     ticket,trade.ResultRetcode(),trade.ResultRetcodeDescription());
+         PrintFormat("[WFAST SLOW] MODIFY FAIL ticket=%I64u",ticket);
          ok=false;
       }
    }
    return ok;
+}
+
+ENUM_ORDER_TYPE_FILLING FillingMode()
+{
+   long mode=SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   if((mode & SYMBOL_FILLING_FOK)==SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
+   if((mode & SYMBOL_FILLING_IOC)==SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
 }
 
 bool OpenLeg(const ENUM_POSITION_TYPE type,const int level)
@@ -303,28 +315,39 @@ bool OpenLeg(const ENUM_POSITION_TYPE type,const int level)
    double lots=LevelLot(level);
    if(lots<=0.0) return false;
 
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetTypeFillingBySymbol(_Symbol);
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol,tick)) return false;
    double pip=PipSize();
    int dev=(pip>0.0)?(int)MathRound(InpMaximumSlippagePips*pip/_Point):0;
-   trade.SetDeviationInPoints((ulong)MathMax(0,dev));
 
-   bool ok=false;
+   MqlTradeRequest req={};
+   MqlTradeResult  res={};
+   req.action=TRADE_ACTION_DEAL;
+   req.magic=InpMagic;
+   req.symbol=_Symbol;
+   req.volume=lots;
+   req.deviation=(ulong)MathMax(0,dev);
+   req.type_filling=FillingMode();
+   req.comment=StringFormat("WFAST SLOW P%d",level);
    if(type==POSITION_TYPE_BUY)
-      ok=trade.Buy(lots,_Symbol,0.0,0.0,0.0,StringFormat("WFAST SLOW P%d",level));
-   else
-      ok=trade.Sell(lots,_Symbol,0.0,0.0,0.0,StringFormat("WFAST SLOW P%d",level));
-
-   if(!ok)
    {
-      PrintFormat("[WFAST SLOW] OPEN FAIL P%d lots=%.2f ret=%u %s",
-                  level,lots,trade.ResultRetcode(),trade.ResultRetcodeDescription());
+      req.type=ORDER_TYPE_BUY;
+      req.price=tick.ask;
+   }
+   else
+   {
+      req.type=ORDER_TYPE_SELL;
+      req.price=tick.bid;
+   }
+
+   if(!OrderSend(req,res) || (res.retcode!=TRADE_RETCODE_DONE && res.retcode!=TRADE_RETCODE_DONE_PARTIAL))
+   {
+      PrintFormat("[WFAST SLOW] OPEN FAIL P%d lots=%.2f ret=%u",level,lots,res.retcode);
       return false;
    }
 
-   double px=trade.ResultPrice();
    PrintFormat("[WFAST SLOW] OPEN %s P%d lots=%.2f price=%.3f",
-               type==POSITION_TYPE_BUY?"BUY":"SELL",level,lots,px);
+               type==POSITION_TYPE_BUY?"BUY":"SELL",level,lots,res.price);
    ApplyBasketProtection();
    return true;
 }
@@ -337,7 +360,6 @@ bool RecoveryTriggered(const BasketState &b,const int next_level)
    double threshold;
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol,tick)) return false;
-
    if(b.type==POSITION_TYPE_BUY)
    {
       threshold=b.p1_price-distance*(next_level-1);
@@ -350,7 +372,6 @@ bool RecoveryTriggered(const BasketState &b,const int next_level)
 void ProcessNewM15Bar()
 {
    if(!SessionAllowed() || !SpreadAllowed()) return;
-
    BasketState b;
    if(ReadBasket(b))
    {
@@ -374,9 +395,6 @@ int OnInit()
 {
    if(InpMaximumTrades<1 || InpFixedLot<=0.0 || TradeDistance()<=0.0)
       return INIT_PARAMETERS_INCORRECT;
-
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetTypeFillingBySymbol(_Symbol);
 
    g_fast_handle=iMA(_Symbol,SIGNAL_TF,SIGNAL_FAST,0,MODE_LWMA,PRICE_CLOSE);
    g_slow_handle=iMA(_Symbol,SIGNAL_TF,SIGNAL_SLOW,0,MODE_LWMA,PRICE_CLOSE);
