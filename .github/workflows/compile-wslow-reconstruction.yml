@@ -46,6 +46,7 @@ jobs:
         run: |
           $mql5="$env:MT5_DIR\MQL5"
           $srcRepo="$env:GITHUB_WORKSPACE\BlackDragon_v14\Experts\WSLOW_v112_Reconstructed.mq5"
+          New-Item -ItemType Directory -Force "$mql5\Experts" | Out-Null
           $src="$mql5\Experts\WSLOW_v112_Reconstructed.mq5"
           $out="$mql5\Experts\WSLOW_v112_Reconstructed.ex5"
           $log="$env:GITHUB_WORKSPACE\build-wslow\compile.log"
