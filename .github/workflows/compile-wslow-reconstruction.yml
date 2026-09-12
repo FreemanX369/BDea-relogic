@@ -1,0 +1,76 @@
+name: Compile WSLOW v1.12 Reconstruction
+
+on:
+  push:
+    branches: [ re/wslow-v112-reconstruct ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  native-compile:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      MT5_DIR: 'C:\Program Files\MetaTrader 5'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+
+      - name: Install MetaTrader toolchain
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile 'mt5setup.exe' -UseBasicParsing
+          Start-Process -FilePath '.\mt5setup.exe' -ArgumentList '/auto' -Wait
+          Start-Sleep -Seconds 10
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+          if(-not(Test-Path "$env:MT5_DIR\metaeditor64.exe")){ throw 'metaeditor64.exe not found' }
+          New-Item -ItemType Directory -Force 'build-wslow' | Out-Null
+
+      - name: Prime MQL5 standard library
+        shell: pwsh
+        run: |
+          $t=Start-Process "$env:MT5_DIR\terminal64.exe" -PassThru
+          Start-Sleep -Seconds 35
+          $t | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+
+      - name: Compile reconstruction 0 errors 0 warnings
+        shell: pwsh
+        run: |
+          $mql5="$env:MT5_DIR\MQL5"
+          $srcRepo="$env:GITHUB_WORKSPACE\BlackDragon_v14\Experts\WSLOW_v112_Reconstructed.mq5"
+          $src="$mql5\Experts\WSLOW_v112_Reconstructed.mq5"
+          $out="$mql5\Experts\WSLOW_v112_Reconstructed.ex5"
+          $log="$env:GITHUB_WORKSPACE\build-wslow\compile.log"
+          Copy-Item $srcRepo $src -Force
+          $raw=Get-Content $src -Raw -Encoding UTF8
+          $enc=New-Object System.Text.UnicodeEncoding($false,$true)
+          [IO.File]::WriteAllText($src,$raw,$enc)
+          Start-Process "$env:MT5_DIR\metaeditor64.exe" -ArgumentList "/compile:`"$src`" /inc:`"$mql5`" /log:`"$log`"" -Wait -NoNewWindow
+          $x=Get-Content $log -Encoding Unicode -Raw
+          Write-Host $x
+          if(-not(Test-Path $out) -or $x -match ' : error ' -or $x -match ' : warning ' -or $x -notmatch '0 errors?,\s*0 warnings?'){
+            throw 'WSLOW reconstruction compile failed'
+          }
+          Copy-Item $out "$env:GITHUB_WORKSPACE\build-wslow\WSLOW_v112_Reconstructed.ex5" -Force
+          Copy-Item $srcRepo "$env:GITHUB_WORKSPACE\build-wslow\WSLOW_v112_Reconstructed.mq5" -Force
+          $srcHash=(Get-FileHash $srcRepo -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ex5Hash=(Get-FileHash "$env:GITHUB_WORKSPACE\build-wslow\WSLOW_v112_Reconstructed.ex5" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size=(Get-Item "$env:GITHUB_WORKSPACE\build-wslow\WSLOW_v112_Reconstructed.ex5").Length
+          "HEAD=$env:SOURCE_SHA`nMQ5_SHA256=$srcHash`nEX5_SHA256=$ex5Hash`nEX5_BYTES=$size" | Out-File "$env:GITHUB_WORKSPACE\build-wslow\PROVENANCE.txt" -Encoding utf8
+          "WSLOW reconstruction PASS 0 errors / 0 warnings" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wslow-v112-reconstruction
+          path: build-wslow/
+          if-no-files-found: warn
+          retention-days: 30
